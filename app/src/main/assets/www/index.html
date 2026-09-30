@@ -936,6 +936,12 @@
         body.eink-mode .lecture-content {
             overflow: hidden !important;
         }
+        /* 末页补白，让按行分页的最后一页起点能滚到位 */
+        body.eink-mode .lecture-content::after {
+            content: '';
+            display: block;
+            height: var(--eink-lecture-tail, 0px);
+        }
         .eink-tap-zone {
             position: absolute;
             top: 0;
@@ -13499,40 +13505,136 @@
                 if (leftZone) leftZone.style.display = 'none';
                 if (rightZone) rightZone.style.display = 'none';
                 if (indicator) indicator.style.display = 'none';
+                einkResetLecturePageLayout(content);
             }
         }
 
+        // 每页起点（content 滚动坐标），由 einkUpdateLecturePages 按行计算
+        let einkLecturePageStarts = [0];
+
+        function einkResetLecturePageLayout(content) {
+            content.style.clipPath = '';
+            content.style.removeProperty('--eink-lecture-tail');
+        }
+
+        // 讲义实际可见高度：扣掉被底部导航栏压住的部分
+        function einkLectureVisibleHeight(content) {
+            const rect = content.getBoundingClientRect();
+            let bottom = rect.top + content.clientHeight;
+            const footer = document.getElementById('lectureFooter');
+            if (footer) {
+                const f = footer.getBoundingClientRect();
+                if (f.height > 0 && f.right > rect.left && f.left < rect.right && f.top < bottom) {
+                    bottom = Math.max(rect.top, f.top);
+                }
+            }
+            return bottom - rect.top;
+        }
+
+        // 收集正文每一行文字/图片的纵向范围（content 滚动坐标）
+        function einkCollectLectureLineRects(content) {
+            const offset = content.scrollTop - content.getBoundingClientRect().top;
+            const lines = [];
+            const range = document.createRange();
+            const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+                acceptNode(node) {
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        return node.nodeValue.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                    }
+                    return (node.tagName === 'IMG' || node.tagName === 'svg') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                }
+            });
+            let node;
+            while ((node = walker.nextNode())) {
+                let rects;
+                if (node.nodeType === Node.TEXT_NODE) {
+                    range.selectNodeContents(node);
+                    rects = range.getClientRects();
+                } else {
+                    rects = [node.getBoundingClientRect()];
+                }
+                for (const r of rects) {
+                    if (r.height > 0 && r.width > 0) lines.push({ top: r.top + offset, bottom: r.bottom + offset });
+                }
+            }
+            return lines;
+        }
+
+        // 按行分页：页底如果切到某一行，下一页就从这一行开始，本页把这行的残影裁掉，
+        // 避免同一行被上下边框各遮住一半。
         function einkUpdateLecturePages() {
             const content = document.getElementById('lectureViewerContent');
             if (!content) return;
             const viewH = content.clientHeight;
-            if (viewH <= 0) {
+            const visibleH = einkLectureVisibleHeight(content);
+            if (viewH <= 0 || visibleH <= 0) {
                 einkLectureTotalPages = 1;
+                einkLecturePageStarts = [0];
                 return;
             }
-            einkLectureTotalPages = Math.max(1, Math.ceil(content.scrollHeight / viewH));
+            const PAD = 4;
+            const lines = einkCollectLectureLineRects(content);
+            const tail = parseFloat(content.style.getPropertyValue('--eink-lecture-tail')) || 0;
+            const contentEnd = content.scrollHeight - tail;
+            const starts = [0];
+            let pageTop = 0;
+            while (pageTop + visibleH < contentEnd && starts.length < 10000) {
+                const pageBottom = pageTop + visibleH;
+                let cut = pageBottom;
+                let changed = true;
+                while (changed) {
+                    changed = false;
+                    for (const l of lines) {
+                        if (l.top > pageTop && l.top < cut && l.bottom > cut - PAD) {
+                            cut = l.top;
+                            changed = true;
+                        }
+                    }
+                }
+                let next = Math.floor(cut === pageBottom ? pageBottom : cut - PAD);
+                // 超过大半页高的元素（大图等）无法整行避让，只能直接切
+                if (next - pageTop < visibleH / 4) next = Math.floor(pageBottom);
+                starts.push(next);
+                pageTop = next;
+            }
+            // 最后一页起点可能超出可滚动范围，在末尾补空白让它能滚到位
+            const needTail = Math.max(0, Math.ceil(starts[starts.length - 1] + viewH - contentEnd));
+            if (needTail !== tail) content.style.setProperty('--eink-lecture-tail', needTail + 'px');
+            einkLecturePageStarts = starts;
+            einkLectureTotalPages = starts.length;
+            let current = 0;
+            for (let i = 0; i < starts.length; i++) {
+                if (starts[i] <= content.scrollTop + 1) current = i;
+            }
+            einkLectureCurrentPage = current;
+            einkApplyLecturePageClip(content, visibleH);
+        }
+
+        function einkApplyLecturePageClip(content, visibleH) {
+            const next = einkLecturePageStarts[einkLectureCurrentPage + 1];
+            const shown = next === undefined ? visibleH : Math.min(visibleH, next - content.scrollTop);
+            const hidden = Math.max(0, content.clientHeight - shown);
+            content.style.clipPath = hidden > 0 ? 'inset(0 0 ' + hidden + 'px 0)' : '';
+        }
+
+        function einkGoLecturePage(delta) {
+            const content = document.getElementById('lectureViewerContent');
+            if (!content) return;
+            einkUpdateLecturePages();
+            const target = einkLectureCurrentPage + delta;
+            if (target < 0 || target >= einkLectureTotalPages) return;
+            einkLectureCurrentPage = target;
+            content.scrollTo({ top: einkLecturePageStarts[target], behavior: 'auto' });
+            einkApplyLecturePageClip(content, einkLectureVisibleHeight(content));
+            einkShowLecturePageIndicator();
         }
 
         function einkLectureNext() {
-            const content = document.getElementById('lectureViewerContent');
-            if (!content) return;
-            einkUpdateLecturePages();
-            if (einkLectureCurrentPage < einkLectureTotalPages - 1) {
-                einkLectureCurrentPage++;
-                content.scrollTo({ top: einkLectureCurrentPage * content.clientHeight, behavior: 'auto' });
-                einkShowLecturePageIndicator();
-            }
+            einkGoLecturePage(1);
         }
 
         function einkLecturePrev() {
-            const content = document.getElementById('lectureViewerContent');
-            if (!content) return;
-            einkUpdateLecturePages();
-            if (einkLectureCurrentPage > 0) {
-                einkLectureCurrentPage--;
-                content.scrollTo({ top: einkLectureCurrentPage * content.clientHeight, behavior: 'auto' });
-                einkShowLecturePageIndicator();
-            }
+            einkGoLecturePage(-1);
         }
 
         let einkIndicatorTimeout = null;
