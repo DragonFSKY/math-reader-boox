@@ -29859,12 +29859,20 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             }
             if (exDoingState) {
                 const key = exPageKey(`${exDoingState.taskId}_${exDoingState.questionIndex}`, exPageIndex);
+                const dbKey = `exercise_drawing_cache_${key}`;
+                const strokesDbKey = `exercise_strokes_cache_${key}`;
                 delete exDrawingCache[key];
                 delete exStrokesCache[key];
-                deleteFileData(`exercise_drawing_cache_${key}`).catch(e => {});
-                deleteFileData(`exercise_strokes_cache_${key}`).catch(e => {});
-                exDeleteDrawingFromCloud(`exercise_drawing_cache_${key}`);
-                exDeleteDrawingFromCloud(`exercise_strokes_cache_${key}`);
+                // 删除必须排进既有保存队列：否则已在队列中的保存（自动保存/退出保存）会在删除
+                // 之后才落盘/上传，把刚清空的内容重新建出来，清除看起来没生效
+                exQueueDrawingSave(() => Promise.all([
+                    deleteFileData(dbKey),
+                    deleteFileData(strokesDbKey)
+                ]).then(() => true, () => false));
+                exQueueDrawingCloudSave(dbKey, () => Promise.all([
+                    exDeleteDrawingFromCloud(dbKey),
+                    exDeleteDrawingFromCloud(strokesDbKey)
+                ]));
                 // 清除后不再回存空白页：否则自动保存/退出保存会把空画布写回，刚删掉的记录又被建出来
                 if (exPages[exPageIndex]) {
                     exPages[exPageIndex].dirtyLocal = false;
