@@ -1035,17 +1035,16 @@
         body.lecture-pen-mode #lectureViewerContent *,
         #lectureDraftCanvasWrapper.active,
         #lectureDraftCanvasWrapper.active *,
-        #nbEditor.show,
-        #nbEditor.show * {
+        body:not(.nb-text-mode) #nbCanvasWrap,
+        body:not(.nb-text-mode) #nbCanvasWrap * {
             -webkit-user-select: none !important;
             user-select: none !important;
             -webkit-touch-callout: none !important;
         }
-        /* 笔记整页沿用阅读/讲义的拦截；只有实际聚焦的文本框恢复光标/选区，
-           不能因文本工具或未编辑的 contenteditable 放开整个书写页。 */
+        /* 文本编辑继续使用原有光标/选区；手写保护与阅读器共用。 */
         body.lecture-pen-mode #lectureViewerContent :is(input, textarea, [contenteditable="true"], [contenteditable="true"] *),
         #lectureDraftCanvasWrapper.active :is(input, textarea, [contenteditable="true"], [contenteditable="true"] *),
-        #nbEditor.show :is(input, textarea, [contenteditable="true"], [contenteditable="true"] *) {
+        body:not(.nb-text-mode) #nbCanvasWrap :is(input, textarea, [contenteditable="true"], [contenteditable="true"] *) {
             -webkit-user-select: text !important;
             user-select: text !important;
             -webkit-touch-callout: default !important;
@@ -13412,7 +13411,7 @@
                 && (target === container || container.contains(target))) return true;
             const element = target && (target.nodeType === 1 ? target : target.parentElement);
             if (!element || !element.closest || element.closest('input, textarea, [contenteditable="true"]')) return false;
-            return !!element.closest('body.lecture-pen-mode #lectureViewerContent, #lectureDraftCanvasWrapper.active, #nbEditor.show');
+            return !!element.closest('body.lecture-pen-mode #lectureViewerContent, #lectureDraftCanvasWrapper.active, body:not(.nb-text-mode) #nbCanvasWrap');
         }
 
         function blockReaderNativeSelectionInPenMode(e) {
@@ -31554,7 +31553,6 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             nbHidePanel();
             nbHideOutline();
             nbClearSelection();
-            nbHideTextToolbar();
             document.getElementById('nbEditor').classList.remove('show');
             nbState.notebookId = null;
             nbState.content = null;
@@ -31936,7 +31934,6 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
         function nbSetTool(tool) {
             if (nbState.tool === tool && (tool === 'lasso' || tool === 'text')) tool = 'pen'; // 再点一次取消
             if (nbState.tool !== 'eraser') nbState.prevTool = nbState.tool;
-            if (tool !== 'text') nbHideTextToolbar();
             nbState.tool = tool;
             if (tool !== 'lasso') nbClearSelection();
             nbUpdateNativeSuspend();
@@ -32635,8 +32632,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             el.style.width = (box.w || 220) + 'px';
             const inner = document.createElement('div');
             inner.className = 'nb-textbox-inner';
-            // 沿用原地点按/新建后的编辑入口；未编辑时不能让浏览器默认聚焦放开选区。
-            inner.contentEditable = 'false';
+            inner.contentEditable = 'true';
             inner.textContent = box.text || '';
             inner.style.fontSize = (box.fontSize || 18) + 'px';
             inner.style.color = box.color || '#111111';
@@ -32656,8 +32652,6 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             inner.addEventListener('focus', () => nbSelectTextBox(box.id));
             // 结束编辑（软键盘收起）后重排一次，恢复正确的适配尺寸
             inner.addEventListener('blur', () => {
-                inner.contentEditable = 'false';
-                clearNativeReaderSelectionInPenMode();
                 setTimeout(() => {
                     const ae = document.activeElement;
                     if (ae && ae.closest && ae.closest('#nbTextLayer')) return;
@@ -32709,7 +32703,6 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                         nbScheduleSave();
                     } else {
                         // 原地点按 → 进入编辑并把光标放到末尾
-                        inner.contentEditable = 'true';
                         inner.focus();
                         try {
                             const range = document.createRange();
@@ -32806,12 +32799,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             nbScheduleSave();
             if (!keepTool) nbSetTool('pen');
             nbSelectTextBox(box.id);
-            setTimeout(() => {
-                const inner = nbTextEl(box.id)?.querySelector('.nb-textbox-inner');
-                if (!inner) return;
-                inner.contentEditable = 'true';
-                inner.focus();
-            }, 60);
+            setTimeout(() => { nbTextEl(box.id)?.querySelector('.nb-textbox-inner')?.focus(); }, 60);
         }
         function nbDeleteTextBox(id) {
             const box = nbFindText(id);
@@ -32856,9 +32844,6 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             bar.style.top = Math.max(58, r.top - er.top - 48) + 'px';
         }
         function nbHideTextToolbar() {
-            const active = document.activeElement;
-            if (active && active.isContentEditable && active.closest('#nbTextLayer')) active.blur();
-            clearNativeReaderSelectionInPenMode();
             document.getElementById('nbTextToolbar')?.classList.remove('show');
             document.querySelectorAll('.nb-textbox.selected').forEach(el => el.classList.remove('selected'));
             nbState.selectedTextId = null;
