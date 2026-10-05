@@ -28873,7 +28873,10 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                     });
                     localSaves.push(pageSave);
                 }
-                if (syncToCloud && page.dirtyCloud && exDrawingCloudReady()) {
+                // 空白页（无笔画无底图）不上传：空白快照会把云端另一台设备的内容盖成空白；
+                // 清空云端用"清除"按钮（删除云端对象），擦空笔画不代表要清空云端
+                const pageBlank = !page.baseImage && page.strokes.length === 0;
+                if (syncToCloud && page.dirtyCloud && !pageBlank && exDrawingCloudReady()) {
                     page.dirtyCloud = false;
                     const drawingData = exDrawingCache[key];
                     const strokesData = exStrokesCache[key] || null;
@@ -28959,10 +28962,34 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             }
             // 本地无数据时尝试从云端拉取（跨设备恢复书写进度）
             let needsLocalSave = false;
-            if (!strokesJson && !imageData && exDrawingCloudReady()) {
-                try { strokesJson = await r2GetObject('exercises/drawings/' + strokesDbKey); } catch(e) {}
-                try { imageData = await r2GetObject('exercises/drawings/' + dbKey); } catch(e) {}
-                if (strokesJson || imageData) {
+            // 本地空白记录（空笔画 JSON）不挡住云端：另一台设备写入的内容应能进来。
+            // 只有 PNG 没有笔画 JSON 的记录可能是矢量笔画机制之前的真实内容，仍按本地优先
+            let localBlankDraft = false;
+            if (strokesJson) {
+                try {
+                    const parsedLocal = JSON.parse(strokesJson);
+                    localBlankDraft = !!parsedLocal && Array.isArray(parsedLocal.strokes) && parsedLocal.strokes.length === 0;
+                } catch(e) {}
+            }
+            if ((!strokesJson && !imageData || localBlankDraft) && exDrawingCloudReady()) {
+                let cloudStrokesJson = null;
+                let cloudImageData = null;
+                try { cloudStrokesJson = await r2GetObject('exercises/drawings/' + strokesDbKey); } catch(e) {}
+                try { cloudImageData = await r2GetObject('exercises/drawings/' + dbKey); } catch(e) {}
+                let cloudStrokeCount = 0;
+                if (cloudStrokesJson) {
+                    try {
+                        const parsedCloud = JSON.parse(cloudStrokesJson);
+                        if (parsedCloud && Array.isArray(parsedCloud.strokes)) cloudStrokeCount = parsedCloud.strokes.length;
+                    } catch(e) {}
+                }
+                // 云端只有空白快照（旧版本会把空白页上传）时不覆盖本地，本地空白照旧
+                const cloudHasContent = cloudStrokeCount > 0 || (!cloudStrokesJson && !!cloudImageData);
+                if (cloudHasContent) {
+                    strokesJson = cloudStrokesJson;
+                    imageData = cloudImageData;
+                }
+                if (cloudHasContent) {
                     let skippedForLocalEdit = false;
                     let cacheError = null;
                     const cached = await exQueueDrawingSave(() => {
@@ -29832,12 +29859,29 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             }
             if (exDoingState) {
                 const key = exPageKey(`${exDoingState.taskId}_${exDoingState.questionIndex}`, exPageIndex);
+                const dbKey = `exercise_drawing_cache_${key}`;
+                const strokesDbKey = `exercise_strokes_cache_${key}`;
                 delete exDrawingCache[key];
                 delete exStrokesCache[key];
-                deleteFileData(`exercise_drawing_cache_${key}`).catch(e => {});
-                deleteFileData(`exercise_strokes_cache_${key}`).catch(e => {});
-                exDeleteDrawingFromCloud(`exercise_drawing_cache_${key}`);
-                exDeleteDrawingFromCloud(`exercise_strokes_cache_${key}`);
+                // 删除必须排进既有保存队列：否则已在队列中的保存（自动保存/退出保存）会在删除
+                // 之后才落盘/上传，把刚清空的内容重新建出来，清除看起来没生效
+                exQueueDrawingSave(() => Promise.all([
+                    deleteFileData(dbKey),
+                    deleteFileData(strokesDbKey)
+                ]).then(() => true, () => false));
+                exQueueDrawingCloudSave(dbKey, () => Promise.all([
+                    exDeleteDrawingFromCloud(dbKey),
+                    exDeleteDrawingFromCloud(strokesDbKey)
+                ]));
+                // 清除后不再回存空白页：否则自动保存/退出保存会把空画布写回，刚删掉的记录又被建出来
+                if (exPages[exPageIndex]) {
+                    exPages[exPageIndex].dirtyLocal = false;
+                    exPages[exPageIndex].dirtyCloud = false;
+                }
+                exDirtyLocal = false;
+                exDirtyCloud = false;
+                clearTimeout(exAutoSaveTimer);
+                exAutoSaveTimer = null;
             }
         }
 
