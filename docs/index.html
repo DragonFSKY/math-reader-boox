@@ -28788,6 +28788,19 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
         // 云端不阻塞退出，但同一页必须按快照顺序上传；否则较慢的旧 PUT 会在
         // 新 PUT 之后完成，使另一台设备恢复出旧笔迹。
         const _exDrawingCloudSavePromises = new Map();
+        // 清除代际：清除前已开始的恢复不能把迟到的云端响应写回本页；
+        // 云端删除尚未完成时也不能把队列中的旧对象重新恢复出来。
+        const _exDrawingPageClearRevisions = new Map();
+        const _exPendingDrawingCloudClears = new Set();
+        function exPageClearRevision(pageKey) {
+            return _exDrawingPageClearRevisions.get(pageKey) || 0;
+        }
+        function exMarkPageCleared(pageKey) {
+            const revision = exPageClearRevision(pageKey) + 1;
+            _exDrawingPageClearRevisions.set(pageKey, revision);
+            _exPendingDrawingCloudClears.add(pageKey);
+            return revision;
+        }
         function exQueueDrawingCloudSave(pageKey, saveWork) {
             const previous = _exDrawingCloudSavePromises.get(pageKey) || Promise.resolve();
             const savePromise = previous.catch(() => {}).then(saveWork);
@@ -28949,6 +28962,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             const restoreGradingGuard = () => restoreGradingKey != null &&
                 _exQuestionGradingTokens.get(restoreGradingKey) === restoreGradingVersion;
             const key = exPageKey(baseKey, p);
+            const clearRevisionAtStart = exPageClearRevision(key);
             const dbKey = `exercise_drawing_cache_${key}`;
             const strokesDbKey = `exercise_strokes_cache_${key}`;
 
@@ -28984,7 +28998,8 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                     } catch(e) {}
                 }
                 // 云端只有空白快照（旧版本会把空白页上传）时不覆盖本地，本地空白照旧
-                const cloudHasContent = cloudStrokeCount > 0 || (!cloudStrokesJson && !!cloudImageData);
+                const cloudHasContent = !_exPendingDrawingCloudClears.has(key) &&
+                    (cloudStrokeCount > 0 || (!cloudStrokesJson && !!cloudImageData));
                 if (cloudHasContent) {
                     strokesJson = cloudStrokesJson;
                     imageData = cloudImageData;
@@ -28994,7 +29009,8 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                     let cacheError = null;
                     const cached = await exQueueDrawingSave(() => {
                         // 排到本次云恢复前的本地编辑必须先落盘；旧云快照不能随后覆盖它。
-                        if (exDrawingEditRevision !== editRevisionAtStart) {
+                        if (exDrawingEditRevision !== editRevisionAtStart ||
+                            exPageClearRevision(key) !== clearRevisionAtStart) {
                             skippedForLocalEdit = true;
                             return true;
                         }
@@ -29056,13 +29072,15 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             // 等待期间已切题/关闭则放弃本次恢复
             const stillValid = () => token === exRestoreToken && exDoingState && exCanvasCtx
                 && `${exDoingState.taskId}_${exDoingState.questionIndex}` === baseKey && p < exPages.length;
+            const clearStillValid = () => exPageClearRevision(key) === clearRevisionAtStart;
             const markMergedPageForSave = () => {
-                if (!stillValid() || (!needsLocalSave && exDrawingEditRevision === editRevisionAtStart)) return;
+                if (!stillValid() || !clearStillValid() ||
+                    (!needsLocalSave && exDrawingEditRevision === editRevisionAtStart)) return;
                 if (p === exPageIndex) exDirtyLocal = true;
                 if (exPages[p]) exPages[p].dirtyLocal = true;
                 exScheduleAutoSave();
             };
-            if (!stillValid()) return;
+            if (!stillValid() || !clearStillValid()) return;
             // 本地读取或 R2 拉取后若有更新评分提交，旧 graded 图片不能再进入草稿缓存/画布。
             if (imageDataFromGradedFallback && !restoreGradingGuard()) imageData = null;
             if (strokesJson) exStrokesCache[key] = strokesJson;
@@ -29091,7 +29109,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                 await new Promise(resolve => {
                     const img = new Image();
                     img.onload = () => {
-                        if (stillValid()) {
+                        if (stillValid() && clearStillValid()) {
                             exApplyRestoredPage(p, null, img);
                             markMergedPageForSave();
                         }
@@ -29804,6 +29822,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             } else if (op.type === 'clear') {
                 exStrokes = [];
                 exBaseImage = null;
+                exPurgeCurrentPageCache();
             } else if (op.type === 'xform') {
                 exApplySnapshot(op.strokes, op.after);
             } else if (op.type === 'add') {
@@ -29846,6 +29865,45 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
             if (canvas) canvas.style.cursor = 'crosshair';
         }
 
+        // 清除/重做清除共用：本机保留明确的空白笔画记录，避免重进时回退到旧评分图；
+        // 云端删除继续排在本页已有保存之后，删除完成前禁止旧云端内容参与恢复。
+        function exPurgeCurrentPageCache() {
+            if (!exDoingState) return;
+            const key = exPageKey(exDoingState.taskId + '_' + exDoingState.questionIndex, exPageIndex);
+            const dbKey = 'exercise_drawing_cache_' + key;
+            const strokesDbKey = 'exercise_strokes_cache_' + key;
+            const clearRevision = exMarkPageCleared(key);
+            const blankStrokesJson = JSON.stringify({ v: 2, strokes: [] });
+            delete exDrawingCache[key];
+            exStrokesCache[key] = blankStrokesJson;
+            exQueueDrawingSave(() => Promise.all([
+                deleteFileData(dbKey),
+                saveFileData(strokesDbKey, blankStrokesJson)
+            ]).then(() => true, () => false));
+            exQueueDrawingCloudSave(dbKey, () => Promise.all([
+                exDeleteDrawingFromCloud(dbKey),
+                exDeleteDrawingFromCloud(strokesDbKey)
+            ]).then(results => {
+                if (exPageClearRevision(key) === clearRevision) {
+                    _exPendingDrawingCloudClears.delete(key);
+                }
+                return results.every(result => result);
+            }, () => {
+                if (exPageClearRevision(key) === clearRevision) {
+                    _exPendingDrawingCloudClears.delete(key);
+                }
+                return false;
+            }));
+            if (exPages[exPageIndex]) {
+                exPages[exPageIndex].dirtyLocal = false;
+                exPages[exPageIndex].dirtyCloud = false;
+            }
+            exDirtyLocal = false;
+            exDirtyCloud = false;
+            clearTimeout(exAutoSaveTimer);
+            exAutoSaveTimer = null;
+        }
+
         // 清除只作用于当前页，其余页保持不动
         function clearExCanvas() {
             if (!exCanvasCtx) return;
@@ -29858,30 +29916,7 @@ ${paper.abstract ? i18n('prompt_abstract_original') + paper.abstract : ''}`;
                 exMarkDirty();
             }
             if (exDoingState) {
-                const key = exPageKey(`${exDoingState.taskId}_${exDoingState.questionIndex}`, exPageIndex);
-                const dbKey = `exercise_drawing_cache_${key}`;
-                const strokesDbKey = `exercise_strokes_cache_${key}`;
-                delete exDrawingCache[key];
-                delete exStrokesCache[key];
-                // 删除必须排进既有保存队列：否则已在队列中的保存（自动保存/退出保存）会在删除
-                // 之后才落盘/上传，把刚清空的内容重新建出来，清除看起来没生效
-                exQueueDrawingSave(() => Promise.all([
-                    deleteFileData(dbKey),
-                    deleteFileData(strokesDbKey)
-                ]).then(() => true, () => false));
-                exQueueDrawingCloudSave(dbKey, () => Promise.all([
-                    exDeleteDrawingFromCloud(dbKey),
-                    exDeleteDrawingFromCloud(strokesDbKey)
-                ]));
-                // 清除后不再回存空白页：否则自动保存/退出保存会把空画布写回，刚删掉的记录又被建出来
-                if (exPages[exPageIndex]) {
-                    exPages[exPageIndex].dirtyLocal = false;
-                    exPages[exPageIndex].dirtyCloud = false;
-                }
-                exDirtyLocal = false;
-                exDirtyCloud = false;
-                clearTimeout(exAutoSaveTimer);
-                exAutoSaveTimer = null;
+                exPurgeCurrentPageCache();
             }
         }
 
